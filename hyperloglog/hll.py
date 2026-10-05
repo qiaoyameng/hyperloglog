@@ -215,3 +215,12 @@ class HyperLogLog(object):
         """
         return get_estimate(self.M, self.m, self.p, self.alpha)
 
+    def joint(self, other, **kwargs):
+        """
+        Jointly estimate |self \\ other|, |other \\ self| and
+        |self n other| from the paired register distributions of two
+        compatible sketches.  Returns a JointEstimate; raises
+        JointEstimationError if the numerical solver fails.
+        """
+        from .joint import joint_estimate
+        return joint_estimate(self, other, **kwargs)
