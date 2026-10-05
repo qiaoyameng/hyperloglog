@@ -33,6 +33,10 @@ If we add a further 1000 random strings (giving a total of 1002 strings) we'll h
 
 Changes:
 ========
+- Added an explicit time protocol to SlidingHyperLogLog: a controllable
+  watermark plus ``max_lateness`` bound which events are still accepted and
+  which historical windows ``card()`` may answer (unanswerable ranges raise
+  ``ValueError``; future records never inflate past queries)
 - Added Sliding window HLL version
 - Added bias correction from HLL++
 
