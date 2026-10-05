@@ -36,6 +36,32 @@ Changes:
 - Added Sliding window HLL version
 - Added bias correction from HLL++
 
+Sliding HyperLogLog time protocol:
+==================================
+
+``SlidingHyperLogLog.card(timestamp, window)`` estimates the cardinality of
+events in ``[timestamp - window, timestamp]`` and never counts events newer
+than ``timestamp``, so historical queries are not inflated by records that
+arrived afterwards.  Two knobs define which history is retained:
+
+.. code-block:: python
+
+    from hyperloglog.shll import SlidingHyperLogLog
+    shll = SlidingHyperLogLog(0.05, 100, allowed_lateness=10)
+    shll.advance_watermark(1000)   # retention horizon H = 1000 - 10
+
+* Events older than the horizon ``H = watermark - allowed_lateness`` are
+  rejected by ``add``; late events inside ``[H, watermark)`` still update the
+  dominant points.
+* ``card``/``card_wlist`` answer exactly any window with lower bound
+  ``timestamp - window >= H`` and raise ``ValueError`` for older windows
+  instead of returning a seemingly precise but wrong number.
+* ``advance_watermark(t)`` moves the watermark forward and safely drops
+  points older than ``t - allowed_lateness``; once every event has expired
+  the estimate is 0.
+* Merging summaries with different watermarks yields the highest watermark;
+  ``allowed_lateness`` must be equal.
+
 References:
 ===========
 
