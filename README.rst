@@ -31,10 +31,34 @@ If we add a further 1000 random strings (giving a total of 1002 strings) we'll h
     print(len(hll))  # 1007
 
 
+Sparse mode:
+============
+
+Counters that only ever see a handful of distinct values (e.g. one counter per
+small tenant) can avoid allocating the full ``m = 2 ** p`` register array by
+starting in the sparse representation.  The counter then keeps the distinct
+64-bit hashes of the added values in a set — the cardinality is exact — and is
+promoted to the dense registers once more than ``sparse_threshold`` distinct
+values have been seen.  Promotion happens exactly once; re-adding known values
+never moves the counter closer to the threshold.  Sparse and dense counters of
+equal precision can be merged in either direction.
+
+.. code-block:: python
+
+    hll = hyperloglog.HyperLogLog(0.01, sparse=True, sparse_threshold=1000)
+    hll.add("hello")
+    print(len(hll))       # 1 (exact while sparse)
+    print(hll.mode)       # 'sparse', becomes 'dense' after promotion
+
+With the default 1% error rate the dense representation always holds 16384
+registers, while a sparse counter with 100 distinct values stores only those
+100 hashes.
+
 Changes:
 ========
 - Added Sliding window HLL version
 - Added bias correction from HLL++
+- Added optional sparse representation with one-time promotion to dense
 
 References:
 ===========
