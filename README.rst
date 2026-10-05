@@ -30,9 +30,27 @@ If we add a further 1000 random strings (giving a total of 1002 strings) we'll h
     [hll.add("".join([string.ascii_letters[random.randint(0, len(string.ascii_letters)-1)] for n in range(30)])) for m in range(1000)]  
     print(len(hll))  # 1007
 
+Sparse mode:
+============
+
+Counters that only ever see a few items (e.g. one per tenant) can avoid
+allocating the full register array by passing ``sparse_threshold``. While
+at most ``sparse_threshold`` distinct items have been added, the counter
+keeps an exact set of their hashes and reports the exact count; adding
+more distinct items promotes it once to the usual dense registers.
+Sparse and dense counters of the same precision can be merged freely.
+
+.. code-block:: python
+
+    hll = hyperloglog.HyperLogLog(0.01, sparse_threshold=100)
+    hll.add("hello")
+    print(len(hll))        # 1 (exact while sparse)
+    print(hll.is_sparse)   # True, no register array allocated yet
+
 
 Changes:
 ========
+- Added optional sparse representation with one-time promotion to dense
 - Added Sliding window HLL version
 - Added bias correction from HLL++
 

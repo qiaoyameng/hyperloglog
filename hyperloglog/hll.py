@@ -110,13 +110,17 @@ class HyperLogLog(object):
     HyperLogLog cardinality counter
     """
 
-    __slots__ = ('alpha', 'p', 'm', 'M')
+    __slots__ = ('alpha', 'p', 'm', 'M', 'sparse_threshold', '_sparse')
 
-    def __init__(self, error_rate):
+    def __init__(self, error_rate, sparse_threshold=None):
         """
         Implementes a HyperLogLog
 
         error_rate = abs_err / cardinality
+
+        sparse_threshold: if set, keep an exact set of distinct hashes
+        (sparse representation) until more than sparse_threshold distinct
+        items are seen, then promote once to the dense register array.
         """
 
         if not (0 < error_rate < 1):
@@ -128,21 +132,92 @@ class HyperLogLog(object):
 
         p = math.ceil(math.log((1.04 / error_rate) ** 2, 2))
 
+        if sparse_threshold is not None:
+            if isinstance(sparse_threshold, bool) or \
+                    not isinstance(sparse_threshold, int):
+                raise ValueError("sparse_threshold must be an integer")
+            if not 1 <= sparse_threshold <= (1 << p):
+                raise ValueError(
+                    "sparse_threshold must be in range [1 : %d]" % (1 << p))
+
         self.alpha = get_alpha(p)
         self.p = p
         self.m = 1 << p
-        self.M = np.zeros(self.m, HLL_COUNTER_TYPE)
+        self.sparse_threshold = sparse_threshold
+        if sparse_threshold is None:
+            self.M = np.zeros(self.m, HLL_COUNTER_TYPE)
+            self._sparse = None
+        else:
+            self.M = None
+            self._sparse = set()
+
+    @property
+    def is_sparse(self):
+        """
+        True while the counter uses the sparse (exact set) representation
+        """
+        return self._sparse is not None
 
     def __getstate__(self):
-        return dict([x, getattr(self, x)] for x in self.__slots__)
+        state = dict([x, getattr(self, x)] for x in self.__slots__)
+        # record the representation mode explicitly so that pickles in the
+        # old format (no mode marker) are never silently reinterpreted
+        state['mode'] = 'sparse' if self.is_sparse else 'dense'
+        return state
 
     def __setstate__(self, d):
+        d = dict(d)
+        mode = d.pop('mode', None)
+
+        if mode not in ('sparse', 'dense'):
+            raise ValueError(
+                'Unknown HyperLogLog serialization format: '
+                'missing or invalid representation mode')
+
         for key in d:
             setattr(self, key, d[key])
 
-        # normalize M from pickles created by pre-NumPy versions (plain list)
-        # or under the other NumPy major version (different counter dtype)
-        self.M = np.asarray(self.M, HLL_COUNTER_TYPE)
+        if mode == 'sparse':
+            if not isinstance(self._sparse, set) or self.M is not None:
+                raise ValueError('Inconsistent sparse HyperLogLog state')
+        else:
+            if self._sparse is not None or self.M is None:
+                raise ValueError('Inconsistent dense HyperLogLog state')
+            # normalize M from pickles created under the other NumPy major
+            # version (different counter dtype)
+            self.M = np.asarray(self.M, HLL_COUNTER_TYPE)
+
+    def _add_hash(self, x):
+        # j = <x_0x_1..x_{p-1}>
+        # w = <x_{p}x_{p+1}..>
+        # M[j] = max(M[j], rho(w))
+        j = x & (self.m - 1)
+        w = x >> self.p
+        rho = get_rho(w, 64 - self.p)
+
+        if rho > self.M[j]:
+            self.M[j] = rho
+
+    def _promote(self):
+        """
+        One-way switch from the sparse hash set to dense registers
+        """
+        x = np.fromiter(self._sparse, np.uint64, len(self._sparse))
+        j = x & (self.m - 1)
+        w = x >> self.p
+        rho = get_rho_vec(w, 64 - self.p)
+
+        M = np.zeros(self.m, HLL_COUNTER_TYPE)
+        np.maximum.at(M, j, rho)
+
+        self.M = M
+        self._sparse = None
+
+    def _add_sparse_hash(self, x):
+        self._sparse.add(x)
+
+        if len(self._sparse) > self.sparse_threshold:
+            self._promote()
 
     def add(self, value):
         """
@@ -155,12 +230,11 @@ class HyperLogLog(object):
         # M[j] = max(M[j], rho(w))
 
         x = int.from_bytes(sha1(packb(value)).digest()[:8], byteorder='big')
-        j = x & (self.m - 1)
-        w = x >> self.p
-        rho = get_rho(w, 64 - self.p)
 
-        if rho > self.M[j]:
-            self.M[j] = rho
+        if self.is_sparse:
+            self._add_sparse_hash(x)
+        else:
+            self._add_hash(x)
 
     def add_bulk(self, values):
         """
@@ -176,6 +250,14 @@ class HyperLogLog(object):
             raise TypeError('values must be a non-string iterable')
 
         x = np.fromiter((int.from_bytes(sha1(packb(value)).digest()[:8], byteorder='big') for value in values), np.uint64)
+
+        if self.is_sparse:
+            self._sparse.update(x.tolist())
+
+            if len(self._sparse) > self.sparse_threshold:
+                self._promote()
+            return
+
         j = x & (self.m - 1)
         w = x >> self.p
         rho = get_rho_vec(w, 64 - self.p)
@@ -191,20 +273,38 @@ class HyperLogLog(object):
         """
         Merge other counters
         """
-        ml = [self.M]
-
         for item in others:
             if self.m != item.m:
                 raise ValueError('Counters precisions should be equal')
-            ml.append(item.M)
 
-        self.M = np.maximum.reduce(ml)
+        for item in others:
+            if self.is_sparse and item.is_sparse:
+                self._sparse |= item._sparse
+                continue
+
+            if self.is_sparse:
+                self._promote()
+
+            if item.is_sparse:
+                for x in item._sparse:
+                    self._add_hash(x)
+            else:
+                self.M = np.maximum(self.M, item.M)
+
+        if self.is_sparse and len(self._sparse) > self.sparse_threshold:
+            self._promote()
 
     def __eq__(self, other):
         if not isinstance(other, HyperLogLog):
             return NotImplemented
 
-        return self.m == other.m and np.array_equal(self.M, other.M)
+        if self.m != other.m or self.is_sparse != other.is_sparse:
+            return False
+
+        if self.is_sparse:
+            return self._sparse == other._sparse
+
+        return np.array_equal(self.M, other.M)
 
     def __len__(self):
         return round(self.card())
@@ -213,5 +313,8 @@ class HyperLogLog(object):
         """
         Returns the estimate of the cardinality
         """
-        return get_estimate(self.M, self.m, self.p, self.alpha)
+        if self.is_sparse:
+            # sparse mode stores every distinct hash, so the count is exact
+            return float(len(self._sparse))
 
+        return get_estimate(self.M, self.m, self.p, self.alpha)
