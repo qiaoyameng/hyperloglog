@@ -30,6 +30,26 @@ If we add a further 1000 random strings (giving a total of 1002 strings) we'll h
     [hll.add("".join([string.ascii_letters[random.randint(0, len(string.ascii_letters)-1)] for n in range(30)])) for m in range(1000)]  
     print(len(hll))  # 1007
 
+Joint estimation of two sketches:
+=================================
+
+``estimate_joint(a, b)`` estimates |A ∩ B|, |A \\ B| and |B \\ A| from the
+joint distribution of the paired registers (joint MLE, see
+https://arxiv.org/abs/1706.07290), instead of the naive
+``card(A) + card(B) - card(A | B)`` inclusion-exclusion which may go
+negative. Both sketches must be HyperLogLog counters with equal precision.
+
+.. code-block:: python
+
+    from hyperloglog import HyperLogLog, estimate_joint
+    r = estimate_joint(a, b)
+    print(r.intersection, r.a_only, r.b_only, r.union)
+    print(r.converged, r.status)  # check solver convergence before trusting values
+
+The components are always non-negative and satisfy the basic set bounds.
+If the numerical solver does not converge, ``converged`` is False (and
+``strict=True`` raises ``JointEstimationError``) instead of silently
+returning a bogus value.
 
 Changes:
 ========
