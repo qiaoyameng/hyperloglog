@@ -33,8 +33,32 @@ If we add a further 1000 random strings (giving a total of 1002 strings) we'll h
 
 Changes:
 ========
+- Added explicit precision downsampling and merging of counters configured
+  for different error rates (``hll.downsample(p)`` / ``HyperLogLog.merge``)
 - Added Sliding window HLL version
 - Added bias correction from HLL++
+
+Merging counters with different precisions:
+===========================================
+
+Counters built for different error rates have different precisions and
+``update`` refuses to merge them directly. Precision can only be lowered
+(a low precision summary can never fake a higher one), so downsample one
+or both counters to a common precision and then merge:
+
+.. code-block:: python
+
+    import hyperloglog
+
+    fine = hyperloglog.HyperLogLog(0.01)
+    coarse = hyperloglog.HyperLogLog(0.05)
+
+    # explicit downsample; the source summary is returned unchanged
+    coarse_copy_of_fine = fine.downsample(coarse.p)
+
+    # or merge in one step at the lowest precision of the inputs
+    merged = hyperloglog.HyperLogLog.merge(fine, coarse)
+    # merged = hyperloglog.HyperLogLog.merge(fine, coarse, p=4)  # even coarser
 
 References:
 ===========

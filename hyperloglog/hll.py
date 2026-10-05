@@ -133,6 +133,27 @@ class HyperLogLog(object):
         self.m = 1 << p
         self.M = np.zeros(self.m, HLL_COUNTER_TYPE)
 
+    @classmethod
+    def _from_p(cls, p, M=None):
+        """
+        Build a counter from an explicit precision p (instead of an error
+        rate), optionally seeding it with an existing register vector
+        """
+        if not (4 <= p <= 16):
+            raise ValueError("p=%d should be in range [4 : 16]" % p)
+
+        hll = cls.__new__(cls)
+        hll.alpha = get_alpha(p)
+        hll.p = p
+        hll.m = 1 << p
+
+        if M is None:
+            hll.M = np.zeros(hll.m, HLL_COUNTER_TYPE)
+        else:
+            hll.M = np.asarray(M, HLL_COUNTER_TYPE).reshape(hll.m).copy()
+
+        return hll
+
     def __getstate__(self):
         return dict([x, getattr(self, x)] for x in self.__slots__)
 
@@ -155,6 +176,18 @@ class HyperLogLog(object):
         # M[j] = max(M[j], rho(w))
 
         x = int.from_bytes(sha1(packb(value)).digest()[:8], byteorder='big')
+        self.add_hash(x)
+
+    def add_hash(self, x):
+        """
+        Adds an already computed 64-bit hash value to the HyperLogLog.
+
+        This allows callers (and tests) to control the exact bit pattern
+        that is fed into the register update.
+        """
+        if not (0 <= x < (1 << 64)):
+            raise ValueError('hash value must be an unsigned 64-bit integer')
+
         j = x & (self.m - 1)
         w = x >> self.p
         rho = get_rho(w, 64 - self.p)
@@ -176,6 +209,36 @@ class HyperLogLog(object):
             raise TypeError('values must be a non-string iterable')
 
         x = np.fromiter((int.from_bytes(sha1(packb(value)).digest()[:8], byteorder='big') for value in values), np.uint64)
+        self.add_hash_bulk(x)
+
+    def add_hash_bulk(self, x):
+        """
+        Bulk-adds an iterable of already computed 64-bit hash values
+        """
+        x = np.asarray(x)
+
+        if x.ndim == 0:
+            x = x.reshape(1)
+
+        if x.size == 0:
+            return
+
+        # validate against the original dtype so that out-of-range values
+        # are not masked by a cast to uint64
+        if np.issubdtype(x.dtype, np.integer):
+            if np.any(x < 0) or np.any(x >= (1 << 64)):
+                raise ValueError('hash values must be unsigned 64-bit integers')
+            x = x.astype(np.uint64)
+        else:
+            # object arrays / lists holding Python ints: check each value
+            items = x.reshape(-1).tolist()
+            for value in items:
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise TypeError('hash values must be integers')
+                if not (0 <= value < (1 << 64)):
+                    raise ValueError('hash values must be unsigned 64-bit integers')
+            x = np.asarray(items, dtype=np.uint64).reshape(x.shape)
+
         j = x & (self.m - 1)
         w = x >> self.p
         rho = get_rho_vec(w, 64 - self.p)
@@ -189,16 +252,129 @@ class HyperLogLog(object):
 
     def update(self, *others):
         """
-        Merge other counters
+        Merge other counters of the same precision.
+
+        Counters built for different error rates use different register
+        layouts and cannot be merged directly. Use :meth:`downsample` to
+        lower the precision explicitly and :meth:`merge` to combine
+        counters at a common (lower) precision.
         """
         ml = [self.M]
 
         for item in others:
+            if not isinstance(item, HyperLogLog):
+                raise TypeError('can only merge HyperLogLog counters')
             if self.m != item.m:
                 raise ValueError('Counters precisions should be equal')
             ml.append(item.M)
 
         self.M = np.maximum.reduce(ml)
+
+    def copy(self):
+        """
+        Returns an independent copy of the counter
+        """
+        return self._from_p(self.p, self.M)
+
+    def downsample(self, p):
+        """
+        Returns a copy of this counter reduced to precision p (p <= self.p).
+
+        Precision can only be lowered, never raised: the information needed
+        to split one coarse register into finer ones does not exist, so a
+        low precision counter can never fake a higher one.
+
+        The register values are recomputed from the 64-bit hash layout used
+        by add(): the low p bits of the hash x are the index j and the
+        remaining bits form w = x >> p, with rho(w) = 65 - p
+        - bit_length(w) (bit_length(0) == 0).
+
+        Lowering the precision by d = self.p - p bits makes every coarse
+        bucket j receive strided source buckets j + c * 2**p for
+        c in range(2**d) (NOT consecutive buckets, which would mix up the
+        index bits). For a source register R the rank at the lower
+        precision is:
+
+          * R, if R < 65 - self.p (w had at least one 1 bit; shifting in
+            the d lost index bits adds exactly d to its bit_length, so the
+            rank at the lower precision is unchanged);
+          * (65 - p) - bit_length(c), if R == 65 - self.p (w was all
+            zeros). The maximum rank means the hashed value equalled the
+            source bucket index j + c * 2**p, which is known while
+            iterating the registers, so at the lower precision w equals c
+            and rho can be recomputed exactly instead of being guessed or
+            blindly clamped to the new maximum rank.
+
+        This counter is left unchanged.
+        """
+        if not isinstance(p, int):
+            raise TypeError('p must be an integer')
+
+        if not (4 <= p <= 16):
+            raise ValueError("p=%d should be in range [4 : 16]" % p)
+
+        if p > self.p:
+            raise ValueError('cannot downsample to higher precision')
+
+        if p == self.p:
+            return self.copy()
+
+        d = self.p - p
+        dst_m = 1 << p
+        max_rank_src = 65 - self.p
+        max_rank_dst = 65 - p
+
+        # reshape as (2**d, 2**p): source buckets sharing coarse bucket j
+        # are strided by dst_m, i.e. row c covers bucket j + c * dst_m
+        grouped = self.M.astype(np.int64).reshape(2 ** d, dst_m)
+
+        # R = max_rank_src means w was all zero at the source precision, so
+        # the hashed value equalled the source bucket index; at the lower
+        # precision w is therefore the stratum row index c, and rho is
+        # (65 - p) - bit_length(c). bit_length(0) == 0 yields the new
+        # maximum rank for row c = 0.
+        row_rho = max_rank_dst - bit_length_vec(
+            np.arange(2 ** d, dtype=np.int64))
+        transformed = np.where(
+            grouped == max_rank_src, row_rho[:, np.newaxis], grouped)
+
+        M_dst = np.max(transformed, axis=0)
+
+        return self._from_p(p, M_dst)
+
+    @classmethod
+    def merge(cls, *counters, p=None):
+        """
+        Merge counters configured with different error rates.
+
+        All counters are downsampled to a common precision p, which
+        defaults to the lowest precision among the inputs. p cannot exceed
+        the precision of any input counter. The source counters are never
+        modified.
+        """
+        if not counters:
+            raise ValueError('at least one counter is required')
+
+        for item in counters:
+            if not isinstance(item, cls):
+                raise TypeError('can only merge HyperLogLog counters')
+
+        min_p = min(item.p for item in counters)
+
+        if p is None:
+            p = min_p
+
+        if not isinstance(p, int):
+            raise TypeError('p must be an integer')
+
+        if p > min_p:
+            raise ValueError(
+                'common precision p=%d exceeds the lowest input precision %d'
+                % (p, min_p))
+
+        merged = counters[0].downsample(p)
+        merged.update(*(item.downsample(p) for item in counters[1:]))
+        return merged
 
     def __eq__(self, other):
         if not isinstance(other, HyperLogLog):
@@ -214,4 +390,3 @@ class HyperLogLog(object):
         Returns the estimate of the cardinality
         """
         return get_estimate(self.M, self.m, self.p, self.alpha)
-
