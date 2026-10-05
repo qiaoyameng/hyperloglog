@@ -1,11 +1,14 @@
 #!/usr/bin/env python
 
-from unittest import TestCase
-from hyperloglog.hll import HyperLogLog, get_alpha, get_rho
-from hyperloglog.const import biasData, tresholdData, rawEstimateData
 import math
 import os
 import pickle
+from unittest import TestCase
+
+import numpy as np
+
+from hyperloglog.hll import HyperLogLog, get_alpha, get_rho
+from hyperloglog.const import biasData, tresholdData, rawEstimateData
 
 
 class HyperLogLogTestCase(TestCase):
@@ -123,6 +126,72 @@ class HyperLogLogTestCase(TestCase):
         b = HyperLogLog(0.01)
 
         self.assertRaises(ValueError, a.update, b)
+
+    def test_downsample_recomputes_registers(self):
+        hashes = {}
+
+        for removed in range(4):
+            hashes['max-%d' % removed] = (removed << 4) | removed
+            hashes['rank-58-%d' % removed] = (1 << 6) | (removed << 4) | (4 + removed)
+            hashes['rank-1-%d' % removed] = (1 << 63) | (removed << 4) | (8 + removed)
+
+        expected = [61, 60, 59, 59] + [58] * 4 + [1] * 4 + [0] * 4
+
+        high = HyperLogLog(0.13, hash_func=hashes.get)
+        low = HyperLogLog(0.26, hash_func=hashes.get)
+
+        for value in hashes:
+            high.add(value)
+            low.add(value)
+
+        self.assertEqual(high.p, 6)
+        self.assertEqual(low.p, 4)
+
+        original_high = high.M.copy()
+        downsampled = high.downsample(4)
+
+        np.testing.assert_array_equal(high.M, original_high)
+        np.testing.assert_array_equal(downsampled.M, expected)
+        np.testing.assert_array_equal(downsampled.M, low.M)
+        self.assertIsNot(downsampled.M, high.M)
+
+    def test_downsample_common_precision_update(self):
+        hashes = {}
+
+        for removed in range(4):
+            hashes['max-%d' % removed] = (removed << 4) | removed
+            hashes['rank-58-%d' % removed] = (1 << 6) | (removed << 4) | (4 + removed)
+            hashes['rank-1-%d' % removed] = (1 << 63) | (removed << 4) | (8 + removed)
+
+        values = list(hashes)
+        expected = [61, 60, 59, 59] + [58] * 4 + [1] * 4 + [0] * 4
+
+        high = HyperLogLog(0.13, hash_func=hashes.get)
+        medium = HyperLogLog(0.184, hash_func=hashes.get)
+        low = HyperLogLog(0.26, hash_func=hashes.get)
+
+        high.add_bulk(values[:6])
+        medium.add_bulk(values[6:])
+        low.add_bulk(values)
+
+        self.assertEqual(medium.p, 5)
+
+        original_high = high.M.copy()
+        original_medium = medium.M.copy()
+        merged = high.downsample(4)
+        merged.update(medium.downsample(4))
+
+        np.testing.assert_array_equal(high.M, original_high)
+        np.testing.assert_array_equal(medium.M, original_medium)
+        np.testing.assert_array_equal(merged.M, low.M)
+        np.testing.assert_array_equal(merged.M, expected)
+
+    def test_downsample_does_not_increase_precision(self):
+        hll = HyperLogLog(0.13)
+
+        self.assertRaises(ValueError, hll.downsample, 7)
+        self.assertRaises(ValueError, hll.downsample, 3)
+        self.assertRaises(ValueError, hll.downsample, 4.0)
 
     def test_pickle(self):
         a = HyperLogLog(0.05)

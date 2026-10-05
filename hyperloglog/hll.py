@@ -3,6 +3,7 @@ This module implements probabilistic data structure which is able to calculate t
 """
 
 import math
+import operator
 import numpy as np
 from hashlib import sha1
 from msgpack import packb
@@ -14,6 +15,22 @@ from .const import rawEstimateData as _rawEstimateData, \
 rawEstimateData = tuple(np.array(row) for row in _rawEstimateData)
 biasData = tuple(np.array(row) for row in _biasData)
 tresholdData = tuple(np.array(row) for row in _tresholdData)
+
+
+def hash_value(value):
+    return int.from_bytes(sha1(packb(value)).digest()[:8], byteorder='big')
+
+
+def as_hash_value(x):
+    try:
+        x = operator.index(x)
+    except TypeError as error:
+        raise ValueError('hash must be an unsigned 64-bit integer') from error
+
+    if not (0 <= x < 1 << 64):
+        raise ValueError('hash must be an unsigned 64-bit integer')
+
+    return x
 
 
 def get_treshold(p):
@@ -110,13 +127,14 @@ class HyperLogLog(object):
     HyperLogLog cardinality counter
     """
 
-    __slots__ = ('alpha', 'p', 'm', 'M')
+    __slots__ = ('alpha', 'p', 'm', 'M', 'hash_func')
 
-    def __init__(self, error_rate):
+    def __init__(self, error_rate, hash_func=None):
         """
         Implementes a HyperLogLog
 
         error_rate = abs_err / cardinality
+        hash_func optionally maps a value to an unsigned 64-bit integer
         """
 
         if not (0 < error_rate < 1):
@@ -128,6 +146,7 @@ class HyperLogLog(object):
 
         p = math.ceil(math.log((1.04 / error_rate) ** 2, 2))
 
+        self.hash_func = hash_func if hash_func is not None else hash_value
         self.alpha = get_alpha(p)
         self.p = p
         self.m = 1 << p
@@ -139,6 +158,9 @@ class HyperLogLog(object):
     def __setstate__(self, d):
         for key in d:
             setattr(self, key, d[key])
+
+        if not hasattr(self, 'hash_func'):
+            self.hash_func = hash_value
 
         # normalize M from pickles created by pre-NumPy versions (plain list)
         # or under the other NumPy major version (different counter dtype)
@@ -154,7 +176,7 @@ class HyperLogLog(object):
         # w = <x_{p}x_{p+1}..>
         # M[j] = max(M[j], rho(w))
 
-        x = int.from_bytes(sha1(packb(value)).digest()[:8], byteorder='big')
+        x = as_hash_value(self.hash_func(value))
         j = x & (self.m - 1)
         w = x >> self.p
         rho = get_rho(w, 64 - self.p)
@@ -175,7 +197,7 @@ class HyperLogLog(object):
         if isinstance(values, (bytes, str)) or not hasattr(values, '__iter__'):
             raise TypeError('values must be a non-string iterable')
 
-        x = np.fromiter((int.from_bytes(sha1(packb(value)).digest()[:8], byteorder='big') for value in values), np.uint64)
+        x = np.fromiter((as_hash_value(self.hash_func(value)) for value in values), np.uint64)
         j = x & (self.m - 1)
         w = x >> self.p
         rho = get_rho_vec(w, 64 - self.p)
@@ -186,6 +208,42 @@ class HyperLogLog(object):
         grouped_rho = np.maximum.reduceat(rho[sort_inv], group_start_indices)
 
         self.M[unique_j] = np.maximum(self.M[unique_j], grouped_rho)
+
+    def downsample(self, p):
+        """
+        Return a copy reduced to precision p without changing this summary.
+        """
+        if not isinstance(p, int) or not (4 <= p <= self.p):
+            raise ValueError('p should be an integer in range [4 : %d]' % self.p)
+
+        result = HyperLogLog.__new__(HyperLogLog)
+        result.alpha = get_alpha(p)
+        result.p = p
+        result.m = 1 << p
+        result.M = np.zeros(result.m, HLL_COUNTER_TYPE)
+        result.hash_func = self.hash_func
+
+        source_max_rank = 64 - self.p + 1
+        target_max_rank = 64 - p + 1
+
+        for source_j, rank in enumerate(self.M):
+            if rank == 0:
+                continue
+
+            rank = int(rank)
+            target_j = source_j & (result.m - 1)
+
+            if rank == source_max_rank:
+                removed_bucket_bits = source_j >> p
+                if removed_bucket_bits == 0:
+                    rank = target_max_rank
+                else:
+                    rank = target_max_rank - removed_bucket_bits.bit_length()
+
+            if rank > result.M[target_j]:
+                result.M[target_j] = rank
+
+        return result
 
     def update(self, *others):
         """
@@ -214,4 +272,3 @@ class HyperLogLog(object):
         Returns the estimate of the cardinality
         """
         return get_estimate(self.M, self.m, self.p, self.alpha)
-
